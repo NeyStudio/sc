@@ -10,14 +10,14 @@ const server = http.createServer(app);
 // Configuration de CORS : Autoriser la connexion depuis n'importe quel domaine (*)
 // Pour la production, remplacez '*' par l'URL de votre site Netlify : 'https://votre-site-netlify.app'
 app.use(cors({
-    origin: "*", 
+    origin: "https://myjournaly.quest", 
     methods: ["GET", "POST"]
 }));
 
 // Configuration de Socket.IO
 const io = new Server(server, {
     cors: {
-        origin: "*", // Doit correspondre à l'origine dans app.use(cors)
+        origin: "https://myjournaly.quest", // Doit correspondre à l'origine dans app.use(cors)
         methods: ["GET", "POST"]
     }
 });
