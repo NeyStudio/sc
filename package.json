@@ -10,6 +10,6 @@
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
     "cors": "^2.8.5",
-    "mongoose": "^8.4.1" 
+    "pg": "^8.12.0" 👈 Nouveau driver PostgreSQL
   }
 }
