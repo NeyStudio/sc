@@ -4,7 +4,7 @@
   "description": "Serveur Socket.IO pour le chat A & B",
   "main": "server.js",
   "scripts": {
-    "start": "exec node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
