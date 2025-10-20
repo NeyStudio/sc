@@ -75,6 +75,11 @@ async function startServer() {
         process.exit(1); 
     }
 }
+// Endpoint HTTP simple pour la vérification de santé (Health Check)
+// C'est ce que Railway teste pour s'assurer que le serveur est actif.
+app.get('/', (req, res) => {
+    res.status(200).send('Chat Backend is running and healthy!');
+});
 
 
 // --- 3. GESTION DES CONNEXIONS SOCKET.IO (Temps réel et Persistance) ---
