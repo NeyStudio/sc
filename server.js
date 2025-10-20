@@ -6,6 +6,11 @@ const cors = require('cors');
 const { Client } = require('pg'); 
 
 const app = express();
+// Permet de s'assurer qu'Express reçoit l'adresse IP de l'utilisateur
+// et le protocole (http/https) lorsque l'application est derrière un proxy
+// (ce qui est toujours le cas sur Railway).
+app.set('trust proxy', 1); // 👈 C'EST LA LIGNE CLÉ
+
 const server = http.createServer(app);
 
 // --- 1. CONFIGURATION DU SERVEUR (CORS & PORT) ---
