@@ -6,18 +6,14 @@ const cors = require('cors');
 const { Client } = require('pg'); 
 
 const app = express();
-// Permet de s'assurer qu'Express reçoit l'adresse IP de l'utilisateur
-// et le protocole (http/https) lorsque l'application est derrière un proxy
-// (ce qui est toujours le cas sur Railway).
-app.set('trust proxy', 1); // 👈 C'EST LA LIGNE CLÉ
+app.set('trust proxy', 1); 
 
 const server = http.createServer(app);
 
 // --- 1. CONFIGURATION DU SERVEUR (CORS & PORT) ---
 
-// EN PRODUCTION, REMPLACEZ L'URL GÉNÉRIQUE PAR L'URL EXACTE DE VOTRE PWA
 const allowedOrigin = process.env.NODE_ENV === 'production' 
-    ? 'https://myjournaly.quest' 
+    ? 'https://myjournaly.quest' // 👈 VÉRIFIEZ ET REMPLACEZ CETTE URL !
     : '*'; 
 
 app.use(cors({ origin: allowedOrigin, methods: ["GET", "POST"] }));
@@ -26,38 +22,42 @@ const io = new Server(server, {
     cors: { origin: allowedOrigin, methods: ["GET", "POST"] } 
 });
 
+const connectedUsers = {}; // NOUVEAU : Map pour suivre les utilisateurs en ligne (Socket ID -> Nom)
+
+// Fonction utilitaire pour diffuser la liste des utilisateurs en ligne
+const emitOnlineUsers = () => {
+    // On extrait uniquement les noms d'utilisateur à partir de la map des sockets
+    // et filtre pour s'assurer que seuls 'Olga' ou 'Eric' sont comptés
+    const allowedUsers = ['Olga', 'Eric'];
+    const onlineUsers = Object.values(connectedUsers).filter(name => allowedUsers.includes(name));
+    io.emit('online users', onlineUsers);
+};
+
 // Railway fournit le port via process.env.PORT
 const PORT = process.env.PORT || 3000; 
 
-// Déclaration du client de base de données
 let pgClient; 
 
 // --- 2. FONCTION DE DÉMARRAGE ASYNCHRONE ---
-
-// La fonction principale qui gère la connexion à la base de données
-// et, seulement si elle réussit, démarre le serveur Express/Socket.io
 async function startServer() {
     const DATABASE_URL = process.env.DATABASE_URL;
 
     if (!DATABASE_URL) {
         console.error("ERREUR CRITIQUE: La variable d'environnement DATABASE_URL n'est pas définie. Impossible de continuer.");
-        return; // Arrêt du processus si la variable manque
+        return; 
     }
 
     try {
-        // Initialisation du client PostgreSQL
         pgClient = new Client({
             connectionString: DATABASE_URL,
-            ssl: {
-                rejectUnauthorized: false,
-            },
+            ssl: { rejectUnauthorized: false },
         });
 
-        // 1. Connexion à la base de données (étape synchrone)
+        // 1. Connexion à la base de données
         await pgClient.connect();
         console.log('✅ Connecté à PostgreSQL Railway.');
 
-        // 2. Création de la Table (étape synchrone)
+        // 2. Création de la Table
         const createTableQuery = `
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -69,19 +69,17 @@ async function startServer() {
         await pgClient.query(createTableQuery);
         console.log('✅ Table "messages" vérifiée/créée.');
 
-        // 3. Lancement du Serveur (Seulement après la BDD)
+        // 3. Lancement du Serveur
         server.listen(PORT, () => {
             console.log(`🚀 Serveur de chat démarré sur le port ${PORT}`);
         });
 
     } catch (err) {
         console.error('❌ Erreur critique au démarrage (BDD ou Server):', err.stack);
-        // Si la connexion échoue, le processus doit s'arrêter pour éviter les erreurs
         process.exit(1); 
     }
 }
-// Endpoint HTTP simple pour la vérification de santé (Health Check)
-// C'est ce que Railway teste pour s'assurer que le serveur est actif.
+
 app.get('/', (req, res) => {
     res.status(200).send('Chat Backend is running and healthy!');
 });
@@ -99,43 +97,80 @@ io.on('connection', async (socket) => {
                 SELECT sender, message, timestamp 
                 FROM messages 
                 ORDER BY timestamp 
-                DESC LIMIT 50;
+                DESC LIMIT 1000000;
             `;
             const result = await pgClient.query(query);
-            const history = result.rows.reverse(); // Inverse pour l'ordre chronologique
+            const history = result.rows.reverse(); 
             
             socket.emit('history', history);
+            // ENVOYER LE STATUT EN LIGNE IMMÉDIATEMENT
+            emitOnlineUsers(); 
         }
     } catch (e) {
         console.error('Erreur de chargement de l\'historique (PG):', e);
     }
+    
+    // NOUVEAU : Gérer l'identification de l'utilisateur (pour le statut en ligne)
+    socket.on('user joined', (username) => {
+        // Validation stricte : n'accepter que 'Olga' ou 'Eric'
+        if (username === 'Olga' || username === 'Eric') {
+            connectedUsers[socket.id] = username;
+            emitOnlineUsers(); // Diffuser la liste mise à jour
+        }
+    });
+    
+    // NOUVEAU : Gérer l'événement 'typing'
+    socket.on('typing', (sender) => {
+        socket.broadcast.emit('typing', sender);
+    });
+
+    // NOUVEAU : Gérer l'événement 'stop typing'
+    socket.on('stop typing', (sender) => {
+        socket.broadcast.emit('stop typing', sender);
+    });
 
     socket.on('chat message', async (data) => {
         if (!data.message || !data.sender) return;
 
-        // 1. SAUVEGARDER LE MESSAGE EN BASE DE DONNÉES (Requête SQL)
+        let messageToEmit = data; 
+        
+        // 1. SAUVEGARDER LE MESSAGE EN BASE DE DONNÉES ET RÉCUPÉRER L'HORODATAGE
         try {
             if (pgClient) {
+                // Requête pour insérer ET retourner l'horodatage exact créé par la BDD
                 const query = `
                     INSERT INTO messages (sender, message) 
-                    VALUES ($1, $2);
+                    VALUES ($1, $2)
+                    RETURNING timestamp;
                 `;
-                // Utilisation des paramètres ($1, $2) pour prévenir les injections SQL
-                await pgClient.query(query, [data.sender, data.message]);
+                const result = await pgClient.query(query, [data.sender, data.message]);
+                
+                // On s'assure d'utiliser l'horodatage exact de la base de données pour la diffusion
+                messageToEmit = {
+                    sender: data.sender,
+                    message: data.message,
+                    timestamp: result.rows[0].timestamp 
+                };
             }
         } catch (e) {
             console.error('Erreur de sauvegarde du message (PG):', e);
+            // Fallback en cas d'erreur de BDD
+            messageToEmit.timestamp = new Date(); 
         }
         
-        // 2. Émettre le message à TOUS les clients connectés
-        io.emit('chat message', data);
+        // 2. Émettre le message à TOUS les clients connectés (avec l'horodatage BDD)
+        io.emit('chat message', messageToEmit);
     });
 
     socket.on('disconnect', () => {
+        const username = connectedUsers[socket.id];
+        if (username) {
+            delete connectedUsers[socket.id];
+            emitOnlineUsers(); // Diffuser la liste mise à jour après la déconnexion
+        }
         console.log(`Un utilisateur s’est déconnecté. ID: ${socket.id}`);
     });
 });
 
 // --- 4. DÉMARRAGE DU PROCESSUS ---
-
-startServer(); // Lancement de la fonction de démarrage
+startServer();
