@@ -99,7 +99,7 @@ io.on('connection', async (socket) => {
                 SELECT sender, message, timestamp 
                 FROM messages 
                 ORDER BY timestamp 
-                DESC LIMIT 50;
+                DESC LIMIT 1000;
             `;
             const result = await pgClient.query(query);
             const history = result.rows.reverse(); // Inverse pour l'ordre chronologique
