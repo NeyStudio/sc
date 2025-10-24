@@ -33,7 +33,7 @@ const emitOnlineUsers = () => {
 const PORT = process.env.PORT || 3000; 
 let pgClient; 
 
-// --- 2. FONCTION DE DÉMARRAGE ASYNCHRONE (CORRECTION & MIGRATION ROBUSTE) ---
+// --- 2. FONCTION DE DÉMARRAGE ASYNCHRONE (GESTION DE LA BDD ET MIGRATION ROBUSTE) ---
 async function startServer() {
     const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -63,7 +63,7 @@ async function startServer() {
         `;
         await pgClient.query(createTableQuery);
 
-        // NOUVEAU: Ajout des colonnes de réponse UNIQUEMENT si elles n'existent pas
+        // Ajout des colonnes de réponse UNIQUEMENT si elles n'existent pas
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER NULL;
         `);
@@ -92,12 +92,12 @@ app.get('/', (req, res) => {
 });
 
 
-// --- 3. GESTION DES CONNEXIONS SOCKET.IO ---
+// --- 3. GESTION DES CONNEXIONS SOCKET.IO (LOGIQUE D'HISTORIQUE ET D'ENVOI CORRIGÉE) ---
 
 io.on('connection', async (socket) => {
     console.log(`Un utilisateur est connecté. ID: ${socket.id}`);
 
-    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION (CORRECTION DE LA REQUÊTE)
+    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION (LOGIQUE CORRIGÉE)
     try {
         if (pgClient) {
             const query = `
@@ -110,28 +110,36 @@ io.on('connection', async (socket) => {
             `;
             const result = await pgClient.query(query);
             
-            // CORRECTION CLÉ: Utiliser .rows.map pour reconstruire l'objet
-            const history = result.rows.reverse().map(row => ({
-                id: row.id,
-                sender: row.sender,
-                message: row.message,
-                timestamp: row.timestamp,
-                // CORRECTION CLÉ: Vérification stricte si l'ID de réponse est un nombre valide
-                replyTo: (row.reply_to_id && typeof row.reply_to_id === 'number') ? {
-                    id: row.reply_to_id,
-                    sender: row.reply_to_sender,
-                    text: row.reply_to_text,
-                } : null, // Retourne null si les champs de citation sont NULL
-            }));
+            // Reconstruction de l'objet replyTo avec vérification stricte de l'existence et du type
+            const history = result.rows.reverse().map(row => {
+                // Vérifier si reply_to_id existe (n'est pas NULL) ET est un ID valide (supérieur à 0)
+                const hasReply = row.reply_to_id && parseInt(row.reply_to_id) > 0;
+
+                return {
+                    id: row.id,
+                    sender: row.sender,
+                    message: row.message,
+                    timestamp: row.timestamp,
+                    // Utiliser l'objet de réponse uniquement si les données sont présentes
+                    replyTo: hasReply ? {
+                        id: parseInt(row.reply_to_id), 
+                        sender: row.reply_to_sender,
+                        text: row.reply_to_text,
+                    } : null, 
+                };
+            });
             
             socket.emit('history', history);
             emitOnlineUsers(); 
         }
     } catch (e) {
-        console.error('❌ Erreur de chargement de l\'historique (PG):', e);
+        console.error('❌ Erreur CRITIQUE de chargement de l\'historique (PG):', e);
+        // Envoyer un historique vide en cas d'erreur critique pour ne pas bloquer le client
+        socket.emit('history', []); 
     }
     
-    // ... (user joined, typing, stop typing inchangés) ...
+    
+    // NOUVEAU : Gérer l'identification de l'utilisateur
     socket.on('user joined', (username) => {
         if (username === 'Olga' || username === 'Eric') {
             connectedUsers[socket.id] = username;
@@ -139,15 +147,17 @@ io.on('connection', async (socket) => {
         }
     });
     
+    // NOUVEAU : Gérer l'événement 'typing'
     socket.on('typing', (sender) => {
         socket.broadcast.emit('typing', sender);
     });
 
+    // NOUVEAU : Gérer l'événement 'stop typing'
     socket.on('stop typing', (sender) => {
         socket.broadcast.emit('stop typing', sender);
     });
 
-    // GESTION DES MESSAGES DE CHAT (Légère correction de la diffusion)
+    // GESTION DES MESSAGES DE CHAT (INSERTION CORRIGÉE)
     socket.on('chat message', async (data) => {
         if (!data.message || !data.sender) return;
 
@@ -157,6 +167,7 @@ io.on('connection', async (socket) => {
         let messageToEmit = {
             sender: data.sender,
             message: data.message,
+            // S'assurer que replyTo est bien null ou un objet propre pour l'émission
             replyTo: isReply ? { 
                 id: replyTo.id, 
                 sender: replyTo.sender, 
@@ -170,6 +181,7 @@ io.on('connection', async (socket) => {
                 let query, values;
                 
                 if (isReply) {
+                    // Requête avec les champs de réponse
                     query = `
                         INSERT INTO messages (sender, message, reply_to_id, reply_to_sender, reply_to_text) 
                         VALUES ($1, $2, $3, $4, $5)
@@ -177,6 +189,7 @@ io.on('connection', async (socket) => {
                     `;
                     values = [data.sender, data.message, replyTo.id, replyTo.sender, replyTo.text];
                 } else {
+                    // Requête standard
                     query = `
                         INSERT INTO messages (sender, message) 
                         VALUES ($1, $2)
@@ -189,7 +202,7 @@ io.on('connection', async (socket) => {
                 
                 // Mise à jour de l'objet à émettre avec l'ID et l'horodatage BDD
                 messageToEmit.timestamp = result.rows[0].timestamp;
-                messageToEmit.id = result.rows[0].id; // IMPORTANT pour que l'ID soit disponible pour d'autres citations
+                messageToEmit.id = result.rows[0].id; 
             }
         } catch (e) {
             console.error('❌ Erreur de sauvegarde du message (PG):', e);
