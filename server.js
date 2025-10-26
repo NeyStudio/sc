@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-// Utilisation du client PostgreSQL (pg)
 const { Client } = require('pg'); 
 
 const app = express();
@@ -58,12 +57,13 @@ async function startServer() {
                 id SERIAL PRIMARY KEY,
                 sender VARCHAR(255) NOT NULL,
                 message TEXT NOT NULL,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                reactions JSONB DEFAULT '[]'::jsonb -- NOUVEAU: Colonne pour les réactions
             );
         `;
         await pgClient.query(createTableQuery);
 
-        // Ajout des colonnes de réponse UNIQUEMENT si elles n'existent pas
+        // Ajout/Vérification des colonnes existantes
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER NULL;
         `);
@@ -74,7 +74,12 @@ async function startServer() {
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_text TEXT NULL;
         `);
 
-        console.log('✅ Table "messages" vérifiée/mise à jour pour la réponse.');
+        // NOUVEAU: Ajout de la colonne reactions si elle n'existe pas déjà
+        await pgClient.query(`
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '[]'::jsonb;
+        `);
+
+        console.log('✅ Table "messages" vérifiée/mise à jour.');
 
         // 3. Lancement du Serveur
         server.listen(PORT, () => {
@@ -92,40 +97,42 @@ app.get('/', (req, res) => {
 });
 
 
-// --- 3. GESTION DES CONNEXIONS SOCKET.IO (LOGIQUE D'HISTORIQUE ET D'ENVOI CORRIGÉE) ---
+// --- 3. GESTION DES CONNEXIONS SOCKET.IO ---
 
 io.on('connection', async (socket) => {
     console.log(`Un utilisateur est connecté. ID: ${socket.id}`);
 
-    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION (LOGIQUE CORRIGÉE)
+    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION
     try {
         if (pgClient) {
             const query = `
                 SELECT 
                     id, sender, message, timestamp, 
-                    reply_to_id, reply_to_sender, reply_to_text
+                    reply_to_id, reply_to_sender, reply_to_text,
+                    reactions -- NOUVEAU: Récupérer les réactions
                 FROM messages 
                 ORDER BY timestamp 
                 DESC LIMIT 1000000;
             `;
             const result = await pgClient.query(query);
             
-            // Reconstruction de l'objet replyTo avec vérification stricte de l'existence et du type
             const history = result.rows.reverse().map(row => {
-                // Vérifier si reply_to_id existe (n'est pas NULL) ET est un ID valide (supérieur à 0)
                 const hasReply = row.reply_to_id && parseInt(row.reply_to_id) > 0;
+                
+                // Assurer que les réactions sont un tableau, même si la BDD est vide ou null
+                const reactions = row.reactions || []; 
 
                 return {
                     id: row.id,
                     sender: row.sender,
                     message: row.message,
                     timestamp: row.timestamp,
-                    // Utiliser l'objet de réponse uniquement si les données sont présentes
                     replyTo: hasReply ? {
                         id: parseInt(row.reply_to_id), 
                         sender: row.reply_to_sender,
                         text: row.reply_to_text,
                     } : null, 
+                    reactions: reactions, // Ajout des réactions
                 };
             });
             
@@ -134,10 +141,8 @@ io.on('connection', async (socket) => {
         }
     } catch (e) {
         console.error('❌ Erreur CRITIQUE de chargement de l\'historique (PG):', e);
-        // Envoyer un historique vide en cas d'erreur critique pour ne pas bloquer le client
         socket.emit('history', []); 
     }
-    
     
     // NOUVEAU : Gérer l'identification de l'utilisateur
     socket.on('user joined', (username) => {
@@ -157,7 +162,7 @@ io.on('connection', async (socket) => {
         socket.broadcast.emit('stop typing', sender);
     });
 
-    // GESTION DES MESSAGES DE CHAT (INSERTION CORRIGÉE)
+    // GESTION DES MESSAGES DE CHAT 
     socket.on('chat message', async (data) => {
         if (!data.message || !data.sender) return;
 
@@ -167,12 +172,12 @@ io.on('connection', async (socket) => {
         let messageToEmit = {
             sender: data.sender,
             message: data.message,
-            // S'assurer que replyTo est bien null ou un objet propre pour l'émission
             replyTo: isReply ? { 
                 id: replyTo.id, 
                 sender: replyTo.sender, 
                 text: replyTo.text 
-            } : null 
+            } : null,
+            reactions: [] // Initialiser les réactions à vide lors de l'envoi
         };
         
         // 1. SAUVEGARDER LE MESSAGE EN BASE DE DONNÉES
@@ -181,7 +186,6 @@ io.on('connection', async (socket) => {
                 let query, values;
                 
                 if (isReply) {
-                    // Requête avec les champs de réponse
                     query = `
                         INSERT INTO messages (sender, message, reply_to_id, reply_to_sender, reply_to_text) 
                         VALUES ($1, $2, $3, $4, $5)
@@ -189,7 +193,6 @@ io.on('connection', async (socket) => {
                     `;
                     values = [data.sender, data.message, replyTo.id, replyTo.sender, replyTo.text];
                 } else {
-                    // Requête standard
                     query = `
                         INSERT INTO messages (sender, message) 
                         VALUES ($1, $2)
@@ -200,7 +203,6 @@ io.on('connection', async (socket) => {
 
                 const result = await pgClient.query(query, values);
                 
-                // Mise à jour de l'objet à émettre avec l'ID et l'horodatage BDD
                 messageToEmit.timestamp = result.rows[0].timestamp;
                 messageToEmit.id = result.rows[0].id; 
             }
@@ -211,6 +213,41 @@ io.on('connection', async (socket) => {
         
         // 2. Émettre le message à TOUS les clients connectés
         io.emit('chat message', messageToEmit);
+    });
+    
+    // NOUVEAU: Gestion de l'ajout/suppression des réactions
+    socket.on('toggle reaction', async (data) => {
+        if (!data.messageId || !data.emoji || !data.user) return;
+        
+        const { messageId, emoji, user } = data;
+        
+        try {
+            // 1. Récupérer le message actuel
+            const currentMsgResult = await pgClient.query('SELECT reactions FROM messages WHERE id = $1', [messageId]);
+            if (currentMsgResult.rows.length === 0) return;
+            
+            let reactions = currentMsgResult.rows[0].reactions || [];
+            
+            // 2. Vérifier si l'utilisateur a déjà réagi avec cet emoji
+            const existingIndex = reactions.findIndex(r => r.user === user && r.emoji === emoji);
+            
+            if (existingIndex !== -1) {
+                // Supprimer la réaction
+                reactions.splice(existingIndex, 1);
+            } else {
+                // Ajouter la réaction
+                reactions.push({ user, emoji });
+            }
+            
+            // 3. Mettre à jour la base de données
+            await pgClient.query('UPDATE messages SET reactions = $1 WHERE id = $2', [reactions, messageId]);
+            
+            // 4. Émettre la mise à jour à tous les clients
+            io.emit('reaction updated', { messageId, reactions });
+            
+        } catch (e) {
+            console.error('❌ Erreur de gestion des réactions (PG):', e);
+        }
     });
 
     socket.on('disconnect', () => {
