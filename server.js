@@ -57,12 +57,12 @@ async function startServer() {
                 id SERIAL PRIMARY KEY,
                 sender VARCHAR(255) NOT NULL,
                 message TEXT NOT NULL,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                reactions JSONB DEFAULT '[]'::jsonb 
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         `;
         await pgClient.query(createTableQuery);
 
+        // Ajout des colonnes de réponse UNIQUEMENT si elles n'existent pas
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER NULL;
         `);
@@ -72,7 +72,8 @@ async function startServer() {
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_text TEXT NULL;
         `);
-
+        
+        // AJOUT DE LA COLONNE REACTIONS (NOUVEAU)
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '[]'::jsonb;
         `);
@@ -95,19 +96,19 @@ app.get('/', (req, res) => {
 });
 
 
-// --- 3. GESTION DES CONNEXIONS SOCKET.IO ---
+// --- 3. GESTION DES CONNEXIONS SOCKET.IO (LOGIQUE D'HISTORIQUE ET D'ENVOI CORRIGÉE) ---
 
 io.on('connection', async (socket) => {
     console.log(`Un utilisateur est connecté. ID: ${socket.id}`);
 
-    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION
+    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION (LOGIQUE CORRIGÉE POUR RÉACTIONS)
     try {
         if (pgClient) {
             const query = `
                 SELECT 
                     id, sender, message, timestamp, 
                     reply_to_id, reply_to_sender, reply_to_text,
-                    reactions 
+                    reactions /* Sélectionner la colonne reactions */
                 FROM messages 
                 ORDER BY timestamp 
                 DESC LIMIT 1000000;
@@ -141,7 +142,8 @@ io.on('connection', async (socket) => {
         socket.emit('history', []); 
     }
     
-    // Gérer l'identification de l'utilisateur
+    
+    // NOUVEAU : Gérer l'identification de l'utilisateur
     socket.on('user joined', (username) => {
         if (username === 'Olga' || username === 'Eric') {
             connectedUsers[socket.id] = username;
@@ -149,17 +151,17 @@ io.on('connection', async (socket) => {
         }
     });
     
-    // Gérer l'événement 'typing'
+    // NOUVEAU : Gérer l'événement 'typing'
     socket.on('typing', (sender) => {
         socket.broadcast.emit('typing', sender);
     });
 
-    // Gérer l'événement 'stop typing'
+    // NOUVEAU : Gérer l'événement 'stop typing'
     socket.on('stop typing', (sender) => {
         socket.broadcast.emit('stop typing', sender);
     });
 
-    // GESTION DES MESSAGES DE CHAT 
+    // GESTION DES MESSAGES DE CHAT (INSERTION CORRIGÉE)
     socket.on('chat message', async (data) => {
         if (!data.message || !data.sender) return;
 
@@ -174,7 +176,7 @@ io.on('connection', async (socket) => {
                 sender: replyTo.sender, 
                 text: replyTo.text 
             } : null,
-            reactions: [] 
+            reactions: [] // Les nouveaux messages commencent sans réaction
         };
         
         // 1. SAUVEGARDER LE MESSAGE EN BASE DE DONNÉES
@@ -212,28 +214,34 @@ io.on('connection', async (socket) => {
         io.emit('chat message', messageToEmit);
     });
     
-    // Gestion de l'ajout/suppression des réactions
+    // NOUVEAU: Gestion de l'ajout/suppression des réactions
     socket.on('toggle reaction', async (data) => {
         if (!data.messageId || !data.emoji || !data.user) return;
         
         const { messageId, emoji, user } = data;
         
         try {
+            // Récupération atomique de l'état actuel des réactions
             const currentMsgResult = await pgClient.query('SELECT reactions FROM messages WHERE id = $1', [messageId]);
             if (currentMsgResult.rows.length === 0) return;
             
             let reactions = currentMsgResult.rows[0].reactions || [];
             
+            // Vérifier si l'utilisateur a déjà réagi avec cet emoji
             const existingIndex = reactions.findIndex(r => r.user === user && r.emoji === emoji);
             
             if (existingIndex !== -1) {
+                // Supprimer la réaction
                 reactions.splice(existingIndex, 1);
             } else {
+                // Ajouter la réaction
                 reactions.push({ user, emoji });
             }
             
+            // Mettre à jour la base de données
             await pgClient.query('UPDATE messages SET reactions = $1 WHERE id = $2', [reactions, messageId]);
             
+            // Émettre la mise à jour à tous les clients
             io.emit('reaction updated', { messageId, reactions });
             
         } catch (e) {
