@@ -73,7 +73,7 @@ async function startServer() {
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_text TEXT NULL;
         `);
         
-        // AJOUT DE LA COLONNE REACTIONS (NOUVEAU)
+        // AJOUT DE LA COLONNE REACTIONS
         await pgClient.query(`
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '[]'::jsonb;
         `);
@@ -101,7 +101,7 @@ app.get('/', (req, res) => {
 io.on('connection', async (socket) => {
     console.log(`Un utilisateur est connecté. ID: ${socket.id}`);
 
-    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION (LOGIQUE CORRIGÉE POUR RÉACTIONS)
+    // ENVOYER L'HISTORIQUE LORS DE LA CONNEXION
     try {
         if (pgClient) {
             const query = `
@@ -143,7 +143,7 @@ io.on('connection', async (socket) => {
     }
     
     
-    // NOUVEAU : Gérer l'identification de l'utilisateur
+    // Gérer l'identification de l'utilisateur
     socket.on('user joined', (username) => {
         if (username === 'Olga' || username === 'Eric') {
             connectedUsers[socket.id] = username;
@@ -151,12 +151,12 @@ io.on('connection', async (socket) => {
         }
     });
     
-    // NOUVEAU : Gérer l'événement 'typing'
+    // Gérer l'événement 'typing'
     socket.on('typing', (sender) => {
         socket.broadcast.emit('typing', sender);
     });
 
-    // NOUVEAU : Gérer l'événement 'stop typing'
+    // Gérer l'événement 'stop typing'
     socket.on('stop typing', (sender) => {
         socket.broadcast.emit('stop typing', sender);
     });
@@ -214,7 +214,7 @@ io.on('connection', async (socket) => {
         io.emit('chat message', messageToEmit);
     });
     
-    // NOUVEAU: Gestion de l'ajout/suppression des réactions
+    // Gestion de l'ajout/suppression des réactions
     socket.on('toggle reaction', async (data) => {
         if (!data.messageId || !data.emoji || !data.user) return;
         
